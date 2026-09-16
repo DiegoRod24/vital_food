@@ -11,12 +11,30 @@ export const initialState = {
   proteinOrder: {},
   wastes: [],
   history: [],
-  settings: { responsible: 'Mamá', branch: 'Vital Foods', compactMode: false }
+  orders: [],
+  settings: {
+    responsible: 'Mamá',
+    branch: 'Vital Foods',
+    compactMode: false,
+    destinationPhone: '',
+    destinationName: 'Compras / Proveedor'
+  }
 }
 
 const clone = value => JSON.parse(JSON.stringify(value))
 const now = () => new Date().toISOString()
 const api = path => `${API_BASE}${path}`
+
+function normalizeState(state = {}) {
+  return {
+    ...clone(initialState),
+    ...state,
+    wastes: Array.isArray(state.wastes) ? state.wastes : [],
+    history: Array.isArray(state.history) ? state.history : [],
+    orders: Array.isArray(state.orders) ? state.orders : [],
+    settings: { ...clone(initialState).settings, ...(state.settings || {}) }
+  }
+}
 
 function getDeviceId() {
   let id = localStorage.getItem(DEVICE_KEY)
@@ -43,7 +61,7 @@ export function loadState() {
   try {
     const raw = localStorage.getItem(KEY) || localStorage.getItem(LEGACY_KEY)
     if (!raw) return clone(initialState)
-    return { ...clone(initialState), ...JSON.parse(raw) }
+    return normalizeState(JSON.parse(raw))
   } catch {
     return clone(initialState)
   }
@@ -59,11 +77,12 @@ function setSyncStatus(status, extra = {}) {
 }
 
 export function saveState(state, { markDirty = true } = {}) {
-  localStorage.setItem(KEY, JSON.stringify(state))
+  const normalized = normalizeState(state)
+  localStorage.setItem(KEY, JSON.stringify(normalized))
   if (markDirty) {
     const meta = readMeta()
     writeMeta({ ...meta, dirty: true, changedAt: now() })
-    queueSync(state)
+    queueSync(normalized)
   }
 }
 
@@ -72,15 +91,14 @@ function queueSync(state) {
   syncTimer = setTimeout(() => pushState(state).catch(() => {}), 850)
 }
 
-function mergeCollections(local = [], remote = []) {
+function mergeCollections(local = [], remote = [], dateKey = 'at') {
   const map = new Map()
   ;[...remote, ...local].forEach(item => item?.id && map.set(item.id, item))
-  return [...map.values()].sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
+  return [...map.values()].sort((a, b) => String(b[dateKey] || b.updatedAt || '').localeCompare(String(a[dateKey] || a.updatedAt || '')))
 }
 
 function mergeStates(local, remote) {
-  return {
-    ...clone(initialState),
+  return normalizeState({
     ...remote,
     ...local,
     inventory: { ...(remote?.inventory || {}), ...(local?.inventory || {}) },
@@ -88,8 +106,9 @@ function mergeStates(local, remote) {
     proteinOrder: { ...(remote?.proteinOrder || {}), ...(local?.proteinOrder || {}) },
     wastes: mergeCollections(local?.wastes, remote?.wastes),
     history: mergeCollections(local?.history, remote?.history).slice(0, 500),
+    orders: mergeCollections(local?.orders, remote?.orders, 'createdAt').slice(0, 300),
     settings: { ...(remote?.settings || {}), ...(local?.settings || {}) }
-  }
+  })
 }
 
 async function fetchRemote() {
@@ -108,6 +127,7 @@ export async function pushState(state = loadState()) {
   setSyncStatus('syncing')
   try {
     const meta = readMeta()
+    const normalized = normalizeState(state)
     const res = await fetch(api('/api/state'), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -115,13 +135,13 @@ export async function pushState(state = loadState()) {
         workspace: WORKSPACE,
         deviceId: getDeviceId(),
         revision: Number(meta.revision || 0),
-        state
+        state: normalized
       })
     })
 
     if (res.status === 409) {
       const conflict = await res.json()
-      const merged = mergeStates(state, conflict.state || {})
+      const merged = mergeStates(normalized, conflict.state || {})
       localStorage.setItem(KEY, JSON.stringify(merged))
       writeMeta({ ...meta, revision: Number(conflict.revision || 0), dirty: true, changedAt: now() })
       remoteListener?.(merged)
@@ -150,11 +170,12 @@ export async function pullState({ force = false } = {}) {
     const meta = readMeta()
     if (meta.dirty && !force) return null
     if (!force && Number(remote.revision || 0) <= Number(meta.revision || 0)) return null
-    localStorage.setItem(KEY, JSON.stringify(remote.state))
+    const normalized = normalizeState(remote.state)
+    localStorage.setItem(KEY, JSON.stringify(normalized))
     writeMeta({ revision: remote.revision, dirty: false, syncedAt: now() })
-    remoteListener?.(remote.state)
+    remoteListener?.(normalized)
     setSyncStatus('synced', { revision: remote.revision })
-    return remote.state
+    return normalized
   } catch (error) {
     setSyncStatus('pending', { message: error.message })
     return null
@@ -213,7 +234,7 @@ export function addHistory(state, type, summary) {
     ...state,
     history: [
       { id: crypto.randomUUID(), type, summary, at: now(), deviceId: getDeviceId() },
-      ...state.history
+      ...(state.history || [])
     ].slice(0, 500)
   }
 }
